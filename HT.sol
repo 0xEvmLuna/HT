@@ -548,7 +548,7 @@ contract HTDAO is Abs {
         "HTDAO",
         18,
         1000000,
-        address(0xDf1b63139e75674CFE14855A42aDC5e3b9221C72),
-        address(0xDf1b63139e75674CFE14855A42aDC5e3b9221C72)
+        address(0xD),
+        address(0xD)
     ) {}
 }
